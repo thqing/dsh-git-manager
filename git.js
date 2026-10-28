@@ -8,6 +8,7 @@
  */
 import { execFile } from 'node:child_process'
 import { promises as fsp } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 
 const US = '\u001f'
@@ -414,6 +415,19 @@ export async function log(repo, params = {}, config = DEFAULTS) {
       }
     })
     .filter((commit) => typeof commit.hash === 'string' && commit.hash.length > 0)
+  // History rewrite (reword) is only safe for commits no remote ref reaches, so
+  // the panel needs one flag per row. A `--all` log mixes branches and gets none.
+  if (!asBoolean(params.all) && commits.length > 0) {
+    const target = typeof params.ref === 'string' && params.ref.trim() !== '' ? params.ref.trim() : 'HEAD'
+    // The positive revision must come first: `--not` negates every revision
+    // that follows it, so `rev-list --not --remotes HEAD` lists nothing at all
+    // and would mark every commit as pushed.
+    const published = await runGit(repo, ['rev-list', target, '--not', '--remotes'], { allowFailure: true })
+    if (published.code === 0) {
+      const unpushed = new Set(published.stdout.split('\n').filter((line) => line !== ''))
+      for (const commit of commits) commit.pushed = !unpushed.has(commit.hash)
+    }
+  }
   return { commits, end: commits.length < max }
 }
 
@@ -716,6 +730,153 @@ export async function planSquash(repo, rawShas) {
   }
 }
 
+/** Quote one path for the shell command string git keeps in GIT_EDITOR. */
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`
+}
+
+/**
+ * `git rebase -i` todo editor: turn the one line for our commit into `reword`.
+ *
+ * The todo prints abbreviated hashes, so the target is matched as a prefix of
+ * the full sha. A merge commit shows up as `merge -C <sha> <label>`; `-c` is the
+ * rewording form and keeps the label that tells git what to merge.
+ */
+const REWORD_SEQUENCE_SCRIPT = `// Mark exactly one commit for rewording in a \`git rebase -i\` todo list.
+const fs = require('node:fs')
+const file = process.argv[2]
+const sha = process.env.DG_REWORD_SHA ?? ''
+const lines = fs.readFileSync(file, 'utf8').split('\\n')
+const rewritten = lines.map((line) => {
+  const parts = line.split(/\\s+/)
+  const hash = parts[1] ?? ''
+  if (parts[0] === 'pick' && hash !== '' && sha.startsWith(hash)) return line.replace(/^pick\\s+/, 'reword ')
+  if (parts[0] === 'merge' && parts[1] === '-C' && (parts[2] ?? '') !== '' && sha.startsWith(parts[2])) {
+    return line.replace(/^merge\\s+-C\\s+/, 'merge -c ')
+  }
+  return line
+})
+fs.writeFileSync(file, rewritten.join('\\n'))
+`
+
+/**
+ * `git rebase -i` message editor: install the caller's message instead of
+ * opening an interactive editor. Reword is the only stopped commit, so this is
+ * called exactly once.
+ */
+const REWORD_EDITOR_SCRIPT = `// Install the requested message where git expects the edited commit message.
+const fs = require('node:fs')
+fs.copyFileSync(process.env.DG_REWORD_MSG, process.argv[2])
+`
+
+/** Is this path present inside the git directory? */
+async function exists(target) {
+  return fsp.access(target).then(() => true, () => false)
+}
+
+/**
+ * Edit the message of one local commit, keeping its tree, author and parents.
+ *
+ * A reword changes only the message, so the commit tree must survive verbatim;
+ * the caller verifies that afterwards. Commits already reachable from a remote
+ * are refused: rewriting them would fork the branch that was pushed.
+ */
+export async function rewordCommit(repo, params = {}) {
+  const sha = firstLine(await git(repo, ['rev-parse', '--verify', `${assertRevision(params.sha, '提交')}^{commit}`]))
+  if (!sha) throw new GitError('找不到要改写的提交')
+  const message = typeof params.message === 'string'
+    ? params.message.replace(/\r\n/g, '\n').replace(/\s+$/, '')
+    : ''
+  if (message.trim() === '') throw new GitError('提交信息不能为空')
+  // `--not --remotes` counts the commits this one has that no remote ref has, so
+  // zero means the commit is already published.
+  const unpublished = Number(firstLine(await git(repo, ['rev-list', '--count', sha, '--not', '--remotes'])) ?? '0')
+  if (unpublished === 0) {
+    throw new GitError('这个提交已经推送到远端，改写提交信息会让本地分支与远端分叉；请只改写未推送的提交')
+  }
+  const original = (await git(repo, ['log', '-1', '--format=%B', sha])).replace(/\s+$/, '')
+  const head = firstLine(await git(repo, ['rev-parse', '--verify', 'HEAD']).catch(() => ''))
+  const result = { sha, subject: firstLine(message) ?? '', message, changed: false }
+  if (original === message) return { ...result, output: '', summary: await repoSummary(repo) }
+  const gitDir = firstLine(await git(repo, ['rev-parse', '--absolute-git-dir']))
+  for (const name of ['rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD']) {
+    if (await exists(path.join(gitDir, name))) {
+      throw new GitError('仓库里有未完成的变基、合并或摘取，请先完成或中止它，再改写提交信息')
+    }
+  }
+  const treeBefore = firstLine(await git(repo, ['rev-parse', 'HEAD^{tree}']))
+  // HEAD is the common case and needs no history rewrite: `--only` keeps staged
+  // changes out of the amended commit, so a dirty index is safe.
+  if (head === sha) {
+    const amended = await mutation(repo, ['commit', '--amend', '--only', '-m', message], '改写提交信息失败')
+    return { ...result, changed: true, output: amended.output, summary: await repoSummary(repo) }
+  }
+  const ancestor = await runGit(repo, ['merge-base', '--is-ancestor', sha, 'HEAD'], { allowFailure: true })
+  if (ancestor.code !== 0) throw new GitError('这个提交不在当前分支的历史上，无法在这里改写')
+  const parent = firstLine(await git(repo, ['rev-parse', '--verify', '--quiet', `${sha}^`]).catch(() => ''))
+  // A message-only rebase replays the commits above this one; without
+  // `--rebase-merges` that would linearize every merge in the range.
+  const range = parent ? `${parent}..HEAD` : 'HEAD'
+  const merges = (await git(repo, ['rev-list', '--merges', range])).trim()
+  const args = ['rebase', '--interactive']
+  if (merges !== '') args.push('--rebase-merges')
+  args.push(parent || '--root')
+  // `--autostash` brings a dirty worktree back with a flat index, so stash by
+  // hand and pop with `--index`: staged changes stay staged, the way the user
+  // left them. The rewrite keeps every tree, so the pop cannot conflict.
+  const stashMessage = `dsh-git-reword-${sha.slice(0, 8)}`
+  let restored = true
+  if ((await git(repo, ['status', '--porcelain'])).trim() !== '') {
+    await mutation(repo, ['stash', 'push', '--include-untracked', '-m', stashMessage], '暂存未提交的改动失败')
+    restored = false
+  }
+  const restore = async () => {
+    if (restored) return ''
+    restored = true
+    const popped = await runGit(repo, ['stash', 'pop', '--index'], { allowFailure: true })
+    return popped.code === 0 ? '' : `未提交的改动已保存在 stash（${stashMessage}），请手动执行 git stash pop --index 恢复。`
+  }
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-git-reword-'))
+  try {
+    const seqPath = path.join(dir, 'sequence.cjs')
+    const editorPath = path.join(dir, 'message.cjs')
+    const messagePath = path.join(dir, 'message.txt')
+    await fsp.writeFile(seqPath, REWORD_SEQUENCE_SCRIPT)
+    await fsp.writeFile(editorPath, REWORD_EDITOR_SCRIPT)
+    await fsp.writeFile(messagePath, message)
+    const rebased = await runGit(repo, args, {
+      allowFailure: true,
+      maxBuffer: 16 * 1024 * 1024,
+      env: {
+        DG_REWORD_SHA: sha,
+        DG_REWORD_MSG: messagePath,
+        GIT_SEQUENCE_EDITOR: `${shellQuote(process.execPath)} ${shellQuote(seqPath)}`,
+        GIT_EDITOR: `${shellQuote(process.execPath)} ${shellQuote(editorPath)}`,
+      },
+    })
+    const output = `${rebased.stdout}${rebased.stderr}`.trim()
+    if (rebased.code !== 0) {
+      // The rewrite is ours (a pending operation was refused above), so aborting
+      // here cannot disturb a rebase the user started.
+      await runGit(repo, ['rebase', '--abort'], { allowFailure: true })
+      const note = await restore()
+      throw new GitError([output || '改写提交信息失败', note].filter(Boolean).join('\n'), `git ${args.join(' ')}`)
+    }
+    const treeAfter = firstLine(await git(repo, ['rev-parse', 'HEAD^{tree}']))
+    const note = await restore()
+    if (treeBefore !== treeAfter) {
+      throw new GitError(
+        [`改写提交信息后工作树发生变化（${treeBefore.slice(0, 8)} → ${treeAfter.slice(0, 8)}），已停止`, note].filter(Boolean).join('\n'),
+        `git ${args.join(' ')}`,
+      )
+    }
+    return { ...result, changed: true, output, summary: await repoSummary(repo) }
+  } finally {
+    await restore()
+    await fsp.rm(dir, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
 /** What the Squash dialog shows before the user confirms. */
 export async function squashPreview(repo, params = {}) {
   const plan = await planSquash(repo, params.shas)
@@ -819,7 +980,7 @@ export async function dispatch(request, deps) {
   if (op === 'capabilities') {
     // The panel probes this to decide whether the running Host generation
     // implements the newest operations (a Host module only reloads on restart).
-    return { engine: 3, ops: ['snapshot', 'squash', 'squashPreview', 'updateProject', 'capabilities'] }
+    return { engine: 4, ops: ['snapshot', 'squash', 'squashPreview', 'updateProject', 'reword', 'capabilities'] }
   }
   if (op === 'version') {
     const stdout = await git(process.cwd(), ['--version']).catch(() => 'git')
@@ -999,6 +1160,8 @@ export async function dispatch(request, deps) {
       args.push(sha)
       return mutation(repo, args, '回滚提交失败')
     }
+    case 'reword':
+      return rewordCommit(repo, payload)
     case 'squashPreview':
       return squashPreview(repo, payload)
     case 'squash':
@@ -1175,6 +1338,7 @@ async function mutation(repo, args, failureMessage, options = {}) {
     allowFailure: true,
     timeout: options.timeout ?? DEFAULTS.timeoutMs,
     maxBuffer: 16 * 1024 * 1024,
+    env: options.env,
   })
   const output = `${result.stdout}${result.stderr}`.trim()
   if (result.code !== 0) {

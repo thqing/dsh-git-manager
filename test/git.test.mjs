@@ -359,9 +359,10 @@ test('squash refuses what it cannot rewrite', async () => {
 
 test('capabilities names the new engine operations', async () => {
   const caps = await dispatch({ op: 'capabilities' }, { config })
-  assert.equal(caps.engine, 3)
+  assert.equal(caps.engine, 4)
   assert.ok(caps.ops.includes('squash'))
   assert.ok(caps.ops.includes('updateProject'))
+  assert.ok(caps.ops.includes('reword'))
 })
 
 test('squash keeps HEAD attached to its branch and never dangles', async () => {
@@ -620,5 +621,198 @@ test('updateProject falls back to origin/<branch> when no upstream is configured
     await runGit(root, ['remote', 'remove', 'origin']).catch(() => {})
     await runGit(root, ['checkout', '-q', 'main']).catch(() => {})
     await fsp.rm(bare, { recursive: true, force: true })
+  }
+})
+
+test('reword rewrites HEAD, an older commit and the root commit', async () => {
+  const work = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-git-reword-'))
+  const out = async (args) => (await runGit(work, args)).stdout.trim()
+  const commitIn = async (name, text, subject) => {
+    await fsp.writeFile(path.join(work, name), text, 'utf8')
+    await runGit(work, ['add', '--all'])
+    await runGit(work, ['commit', '-q', '-m', subject])
+    return out(['rev-parse', 'HEAD'])
+  }
+  try {
+    await runGit(work, ['init', '-q', '-b', 'main'])
+    for (const pair of [['user.name', 'Tester'], ['user.email', 'tester@example.com'], ['commit.gpgsign', 'false']]) {
+      await runGit(work, ['config', ...pair])
+    }
+    const first = await commitIn('one.txt', 'one\n', 'one subject')
+    const second = await commitIn('two.txt', 'two\n', 'two subject')
+    const third = await commitIn('three.txt', 'three\n', 'three subject')
+    const treeBefore = await out(['rev-parse', 'HEAD^{tree}'])
+
+    // HEAD is amended in place, so only HEAD's own hash moves.
+    const head = await dispatch({ op: 'reword', repo: work, sha: third, message: 'three rewritten\n\nbody line' }, { config })
+    assert.equal(head.changed, true)
+    assert.equal(head.subject, 'three rewritten')
+    assert.equal(await out(['log', '-1', '--format=%B']), 'three rewritten\n\nbody line')
+    assert.equal(await out(['rev-parse', 'HEAD^{tree}']), treeBefore, 'the tree must survive a message rewrite')
+
+    // An older commit is rewritten through a rebase; later commits get new hashes.
+    const older = await dispatch({ op: 'reword', repo: work, sha: second, message: 'two rewritten' }, { config })
+    assert.equal(older.changed, true)
+    assert.notEqual(await out(['rev-parse', 'HEAD']), third)
+
+    // The root commit has no parent, so it takes the --root branch.
+    const rootRewrite = await dispatch({ op: 'reword', repo: work, sha: first, message: 'one rewritten' }, { config })
+    assert.equal(rootRewrite.changed, true)
+    assert.deepEqual(await out(['log', '--format=%s']).then((text) => text.split('\n')), ['three rewritten', 'two rewritten', 'one rewritten'])
+    assert.equal(await out(['rev-parse', 'HEAD^{tree}']), treeBefore)
+    assert.equal(await out(['status', '--porcelain']), '', 'a reword must not leave the worktree dirty')
+  } finally {
+    await fsp.rm(work, { recursive: true, force: true })
+  }
+})
+
+test('reword refuses pushed commits, empty messages and a half-finished rebase', async () => {
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-git-reword2-'))
+  const bare = path.join(base, 'remote.git')
+  const work = path.join(base, 'work')
+  const out = async (args) => (await runGit(work, args)).stdout.trim()
+  const commitIn = async (name, text, subject) => {
+    await fsp.writeFile(path.join(work, name), text, 'utf8')
+    await runGit(work, ['add', '--all'])
+    await runGit(work, ['commit', '-q', '-m', subject])
+    return out(['rev-parse', 'HEAD'])
+  }
+  try {
+    await fsp.mkdir(work, { recursive: true })
+    await runGit(base, ['init', '--bare', '-q', '-b', 'main', bare])
+    await runGit(work, ['init', '-q', '-b', 'main'])
+    for (const pair of [['user.name', 'Tester'], ['user.email', 'tester@example.com'], ['commit.gpgsign', 'false']]) {
+      await runGit(work, ['config', ...pair])
+    }
+    const pushed = await commitIn('base.txt', 'base\n', 'pushed subject')
+    await runGit(work, ['remote', 'add', 'origin', bare])
+    await runGit(work, ['push', '-q', '-u', 'origin', 'main'])
+
+    // Published history must stay untouched, or the branch would fork.
+    await assert.rejects(
+      dispatch({ op: 'reword', repo: work, sha: pushed, message: 'nope' }, { config }),
+      /已经推送到远端/,
+    )
+
+    const local = await commitIn('local.txt', 'local\n', 'local subject')
+    await assert.rejects(
+      dispatch({ op: 'reword', repo: work, sha: local, message: '   ' }, { config }),
+      /提交信息不能为空/,
+    )
+
+    const unchanged = await dispatch({ op: 'reword', repo: work, sha: local, message: 'local subject' }, { config })
+    assert.equal(unchanged.changed, false)
+    assert.equal(await out(['rev-parse', 'HEAD']), local)
+
+    // A real conflicted rebase leaves rebase-merge/ behind; rewriting now would
+    // corrupt it, so the engine refuses until the user settles the rebase.
+    await runGit(work, ['checkout', '-q', '-b', 'left'])
+    await fsp.writeFile(path.join(work, 'clash.txt'), 'left\n', 'utf8')
+    await runGit(work, ['add', '--all'])
+    await runGit(work, ['commit', '-q', '-m', 'left side'])
+    await runGit(work, ['checkout', '-q', '-b', 'right', 'main'])
+    await fsp.writeFile(path.join(work, 'clash.txt'), 'right\n', 'utf8')
+    await runGit(work, ['add', '--all'])
+    await runGit(work, ['commit', '-q', '-m', 'right side'])
+    await runGit(work, ['checkout', '-q', 'left'])
+    await assert.rejects(runGit(work, ['rebase', 'right']), /conflict|冲突/i)
+    await assert.rejects(
+      dispatch({ op: 'reword', repo: work, sha: local, message: 'blocked' }, { config }),
+      /未完成的变基|未完成的/,
+    )
+    await runGit(work, ['rebase', '--abort'])
+  } finally {
+    await fsp.rm(base, { recursive: true, force: true })
+  }
+})
+
+test('reword keeps merge commits and staged changes', async () => {
+  const work = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-git-reword3-'))
+  const out = async (args) => (await runGit(work, args)).stdout.trim()
+  const commitIn = async (name, text, subject) => {
+    await fsp.writeFile(path.join(work, name), text, 'utf8')
+    await runGit(work, ['add', '--all'])
+    await runGit(work, ['commit', '-q', '-m', subject])
+    return out(['rev-parse', 'HEAD'])
+  }
+  try {
+    await runGit(work, ['init', '-q', '-b', 'main'])
+    for (const pair of [['user.name', 'Tester'], ['user.email', 'tester@example.com'], ['commit.gpgsign', 'false']]) {
+      await runGit(work, ['config', ...pair])
+    }
+    await commitIn('base.txt', 'base\n', 'base commit')
+    await runGit(work, ['checkout', '-q', '-b', 'side'])
+    await commitIn('side.txt', 'side\n', 'side work')
+    await runGit(work, ['checkout', '-q', 'main'])
+    const mainWork = await commitIn('main.txt', 'main\n', 'main work')
+    await runGit(work, ['merge', '-q', '--no-ff', 'side', '-m', 'merge side'])
+    const mergeSha = await out(['rev-parse', 'HEAD'])
+    const treeBefore = await out(['rev-parse', 'HEAD^{tree}'])
+
+    // Rewriting a merge commit must keep it a merge.
+    const merged = await dispatch({ op: 'reword', repo: work, sha: mergeSha, message: 'merge side (rewritten)' }, { config })
+    assert.equal(merged.changed, true)
+    assert.equal((await out(['log', '-1', '--format=%p'])).split(' ').length, 2)
+
+    // A staged change is not part of the rewrite and stays staged afterwards.
+    await fsp.writeFile(path.join(work, 'base.txt'), 'staged change\n', 'utf8')
+    await runGit(work, ['add', 'base.txt'])
+    const below = await dispatch({ op: 'reword', repo: work, sha: mainWork, message: 'main work (rewritten)' }, { config })
+    assert.equal(below.changed, true)
+    assert.equal(await out(['status', '--porcelain']), 'M  base.txt')
+    assert.equal(await out(['rev-list', '--merges', '--count', 'HEAD']), '1')
+    assert.equal(await out(['rev-parse', 'HEAD^{tree}']), treeBefore)
+  } finally {
+    await fsp.rm(work, { recursive: true, force: true })
+  }
+})
+
+test('the log marks only commits no remote can reach as unpushed', async () => {
+  // The flag decides whether «编辑提交信息» is offered, so it has to be exact.
+  // `git rev-list --not --remotes HEAD` looks equivalent but is not: `--not`
+  // negates every revision after it, the output is empty, and every row would
+  // be reported as pushed.
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-git-pushed-'))
+  const bare = path.join(base, 'remote.git')
+  const work = path.join(base, 'work')
+  const commitIn = async (name, text, subject) => {
+    await fsp.writeFile(path.join(work, name), text, 'utf8')
+    await runGit(work, ['add', '--all'])
+    await runGit(work, ['commit', '-q', '-m', subject])
+  }
+  try {
+    await fsp.mkdir(work, { recursive: true })
+    await runGit(base, ['init', '--bare', '-q', '-b', 'main', bare])
+    await runGit(work, ['init', '-q', '-b', 'main'])
+    for (const pair of [['user.name', 'Tester'], ['user.email', 'tester@example.com'], ['commit.gpgsign', 'false']]) {
+      await runGit(work, ['config', ...pair])
+    }
+    await commitIn('base.txt', 'base\n', 'base commit')
+    await runGit(work, ['remote', 'add', 'origin', bare])
+    await runGit(work, ['push', '-q', '-u', 'origin', 'main'])
+
+    await commitIn('local.txt', 'local\n', 'local work')
+    const before = await dispatch({ op: 'snapshot', repo: work }, { config })
+    assert.deepEqual(
+      before.log.commits.map((commit) => commit.pushed),
+      [false, true],
+      'the local commit is unpushed, the base commit is on origin/main',
+    )
+
+    // The panel offers «编辑提交信息» on exactly that row, so the engine has to
+    // accept the same commit instead of refusing it one step later.
+    const local = before.log.commits[0]
+    const rewritten = await dispatch({ op: 'reword', repo: work, sha: local.hash, message: 'local work (rewritten)' }, { config })
+    assert.equal(rewritten.changed, true)
+
+    await runGit(work, ['push', '-q', 'origin', 'main'])
+    const after = await dispatch({ op: 'snapshot', repo: work }, { config })
+    assert.deepEqual(after.log.commits.map((commit) => commit.pushed), [true, true])
+    await assert.rejects(
+      dispatch({ op: 'reword', repo: work, sha: after.log.commits[0].hash, message: 'nope' }, { config }),
+      /已经推送到远端/,
+    )
+  } finally {
+    await fsp.rm(base, { recursive: true, force: true })
   }
 })

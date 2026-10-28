@@ -41,7 +41,7 @@
 | 工具栏 | 刷新、获取、**更新项目**（<kbd>⌘/Ctrl</kbd>+<kbd>T</kbd>）、推送、新建分支、更多（更新项目（总是询问）/ 拉取 / 暂存修改 / 弹出暂存 / 获取并清理 / 合并 / 变基 / 中止合并 / 中止变基 / 提交身份 / 添加远程） |
 | 本地分支右键 | 检出、从此新建分支、合并到当前分支、变基当前分支到此、推送、重命名、创建标签、删除、复制名称 |
 | 远程分支右键 | 检出、新建本地分支、合并、变基、删除远程分支、复制名称 |
-| 提交右键（单选） | 检出（分离头指针）、从此新建分支、创建标签、摘取、回滚、重置（soft/mixed/hard）、复制 hash/信息 |
+| 提交右键（单选） | 检出（分离头指针）、从此新建分支、创建标签、摘取、回滚、**编辑提交信息…**（仅未推送的提交）、重置（soft/mixed/hard）、复制 hash/信息 |
 | 提交右键（**多选区间**） | **Squash Commits…**、复制多个 hash、取消选择（区间内其余单提交操作自动禁用） |
 | 文件右键 | 暂存、取消暂存、丢弃、查看差异 |
 | 标签 / 远程 / 暂存右键 | 检出、推送标签、删除标签；获取 / 拉取 / 推送 / 删除远程；应用 / 弹出 / 删除 stash |
@@ -51,7 +51,7 @@
 （`action` 取值：`status`、`branches`、`log`、`diff`、`stage`、`unstage`、`commit_staged`、
 `checkout`、`create_branch`、`merge`、`rebase`、`revert`、`reset`、`cherry_pick`、
 `stash_push`、`stash_pop`、`stash_list`、`create_tag`、`remotes`、`discover`、
-`update_project`（`strategy`：`merge` / `rebase` / `reset`）等）。
+`update_project`（`strategy`：`merge` / `rebase` / `reset`）、`reword_commit`（`sha` + `message`）等）。
 
 ## 更新项目（Update Project）
 
@@ -97,6 +97,26 @@ IDEA 里对着迁出分支按 <kbd>Ctrl</kbd>+<kbd>T</kbd> 弹出的那个窗口
 
 > ⚠️ Squash 属于 Host 半边的新操作：DSH 每个进程只加载一代 Host 模块，**替换已安装的插件包需要重启 App 才生效**。
 > 面板启动时会调用 `capabilities` 探测当前 Host 代次，未生效时右键里的 Squash 显示为**禁用**并在「提交详情」提示原因，不会静默失败。
+
+## 编辑提交信息（Edit Commit Message）
+
+IDEA 里对着未 push 的提交右键那个 **Edit Commit Message**：在提交右键菜单里选「编辑提交信息…」，
+对话框会带上**完整提交信息**（标题 + 正文，不只是标题），改完点「保存」。
+
+- 只改写**本地未推送**的提交（`git rev-list --count <sha> --not --remotes` 必须大于 0）：
+  已推送的提交在菜单里是**禁用**状态，`title` 说明原因——改写它们会让本地分支与远端分叉。
+- 改写 HEAD 用 `git commit --amend --only`，`--only` 保证**索引里已暂存的改动不会被卷进这次提交**；
+  改写更早的提交用 `git rebase --interactive` + 自动生成的 sequence/editor 脚本
+  （todo 里的缩写 sha 用前缀匹配，避免改写错行）；区间含合并提交时自动加 `--rebase-merges`，
+  merge 行的 `merge -C` 改成 `merge -c` 并保留 label，否则会报 `nothing to merge: ''`。
+- 工作区/索引有未提交改动时先 `git stash push --include-untracked`，改写后 `git stash pop --index`
+  恢复——**已暂存的还算已暂存**（`--autostash` 会把索引状态摊平，所以没用它）。
+- 改写前后校验 `HEAD^{tree}` 不变：只是改信息，绝不该动文件内容；不变才认为是成功。
+- 拒绝的情况：提交信息为空、消息没有实际变化（返回 `changed: false`，面板提示「提交信息没有变化」）、
+  提交已推送、提交不在当前分支历史上、仓库里有未完成的变基 / 合并 / 摘取（先完成或中止它们）。
+- 与 `squash` 一样在 Host 侧**串行化**，并通过 `git_manage`（`action: reword_commit`）暴露给 Agent。
+
+> ⚠️ 同样是 Host 半边的新操作：**替换插件包后需重启 App**，面板才不会提示「宿主尚未实现该操作」。
 
 ## 提交图渲染说明
 
@@ -156,5 +176,5 @@ git clone git@github.com:thqing/dsh-git-manager.git ~/dsh-plugins/dsh-git-manage
 ## 测试
 
 ```bash
-npm test        # node --test test/ ，50 个用例，不需要 DSH
+npm test        # node --test test/ ，62 个用例，不需要 DSH
 ```

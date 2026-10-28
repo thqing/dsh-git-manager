@@ -174,11 +174,11 @@ const SNAPSHOT = {
   log: {
     end: true,
     commits: [
-      { hash: 'e'.repeat(40), parents: ['c'.repeat(40), 'd'.repeat(40)], author: 'tianhaiqing', email: 't@example.com', commitDate: Date.now(), subject: 'Merge branch feature/x into thq-dev', refs: [] },
-      { hash: 'c'.repeat(40), parents: ['b'.repeat(40)], author: 'tianhaiqing', email: 't@example.com', commitDate: Date.now() - 30000, subject: 'fix(web-core): 页面内容区无法滚动', refs: ['HEAD -> thq-dev'] },
-      { hash: 'd'.repeat(40), parents: ['b'.repeat(40)], author: 'tianhaiqing', email: 't@example.com', commitDate: Date.now() - 45000, subject: 'feat: 侧分支提交', refs: ['origin/thq-dev'] },
-      { hash: 'b'.repeat(40), parents: ['a'.repeat(40)], author: 'tianhaiqing', email: 't@example.com', commitDate: Date.now() - 60000, subject: 'docs(swan): 总纲更新', refs: [] },
-      { hash: 'a'.repeat(40), parents: [], author: 'tianhaiqing', email: 't@example.com', commitDate: Date.now() - 120000, subject: 'feat: 初始提交', refs: ['tag: v1.0.0'] },
+      { hash: 'e'.repeat(40), parents: ['c'.repeat(40), 'd'.repeat(40)], author: 'tianhaiqing', email: 't@example.com', commitDate: Date.now(), subject: 'Merge branch feature/x into thq-dev', refs: [], pushed: false },
+      { hash: 'c'.repeat(40), parents: ['b'.repeat(40)], author: 'tianhaiqing', email: 't@example.com', commitDate: Date.now() - 30000, subject: 'fix(web-core): 页面内容区无法滚动', refs: ['HEAD -> thq-dev'], pushed: false },
+      { hash: 'd'.repeat(40), parents: ['b'.repeat(40)], author: 'tianhaiqing', email: 't@example.com', commitDate: Date.now() - 45000, subject: 'feat: 侧分支提交', refs: ['origin/thq-dev'], pushed: true },
+      { hash: 'b'.repeat(40), parents: ['a'.repeat(40)], author: 'tianhaiqing', email: 't@example.com', commitDate: Date.now() - 60000, subject: 'docs(swan): 总纲更新', refs: [], pushed: true },
+      { hash: 'a'.repeat(40), parents: [], author: 'tianhaiqing', email: 't@example.com', commitDate: Date.now() - 120000, subject: 'feat: 初始提交', refs: ['tag: v1.0.0'], pushed: true },
     ],
   },
   stashes: [{ index: 0, selector: 'stash@{0}', subject: 'WIP on thq-dev: 1234567 abc', date: Date.now() }],
@@ -514,7 +514,8 @@ test('graph lines continue from one row into the next and share one column width
 
 /** The panel now has 22 state slots; `selection` is slot 9, `supportsSquash` 21. */
 function panelStates(overrides = {}) {
-  const states = new Array(22).fill(undefined)
+  // 0 repos … 21 supportsSquash, 22 supportsUpdate, 23 supportsReword
+  const states = new Array(24).fill(undefined)
   Object.assign(states, {
     0: [{ path: '/repo/plm', title: 'PLM', isRepo: true }],
     1: '/repo/plm',
@@ -1028,4 +1029,112 @@ test('更新项目 tells the user to restart when the Host cannot update project
   } finally {
     delete globalThis.fetch
   }
+})
+
+test('编辑提交信息 stays disabled until the Host reports the operation', () => {
+  const updates = []
+  const holder = { refs: [] }
+  const { registrations } = install(
+    loadBundle(panelStates({ 23: false }), (index, next) => updates.push({ index, next }), holder),
+    { localeBind: () => () => undefined },
+  )
+  const tree = renderPanel(registrations)
+  const rows = commitRows(tree)
+  const unpushed = rows.find((element) => String(element.props.title).startsWith('c'.repeat(40)))
+  unpushed.props.onContextMenu({ clientX: 4, clientY: 8, preventDefault() {}, stopPropagation() {} })
+  const item = updates.filter((entry) => entry.index === 18).pop().next.items
+    .find((entry) => entry.label === '编辑提交信息…')
+  // An un-restarted Host would answer `未知操作 reword`, so stay disabled and say why.
+  assert.equal(item.disabled, true)
+  assert.equal(item.hint, '宿主尚未实现该操作，重启 DSH 后可用')
+})
+
+test('编辑提交信息 pre-fills the whole message and refuses published commits', async () => {
+  const requests = []
+  globalThis.fetch = async (url, init) => {
+    const body = JSON.parse(init.body)
+    requests.push(body)
+    let data = SNAPSHOT
+    if (body.op === 'commit') {
+      data = { commit: { hash: body.sha, subject: 'fix(web-core): 页面内容区无法滚动', body: '原来的正文行', author: 'tianhaiqing' } }
+    } else if (body.op === 'reword') {
+      data = { sha: body.sha, subject: 'fix(web-core): 页面内容区可以滚动了', changed: true, output: '', summary: SNAPSHOT.summary }
+    }
+    return { ok: true, json: async () => ({ ok: true, data }) }
+  }
+  const flush = () => new Promise((resolve) => setTimeout(resolve, 0))
+  const updates = []
+  const holder = { refs: [] }
+  const { registrations } = install(
+    loadBundle(panelStates(), (index, next) => updates.push({ index, next }), holder),
+    { localeBind: () => () => undefined },
+  )
+  const tree = renderPanel(registrations)
+  const commitRows = (root) => {
+    const found = []
+    const collect = (element) => {
+      if (!element || typeof element !== 'object') return
+      if (Array.isArray(element)) { element.forEach(collect); return }
+      if (element.$$element !== true) return
+      if (typeof element.props?.className === 'string' && element.props.className.startsWith('dg-commit')) found.push(element)
+      element.children.forEach(collect)
+      if (typeof element.type === 'function') collect(element.type(element.props))
+    }
+    collect(root)
+    return found
+  }
+  const rows = commitRows(tree)
+  const row = (hash) => rows.find((element) => String(element.props.title).startsWith(hash))
+  const unpushed = row('c'.repeat(40))
+  const published = row('d'.repeat(40))
+  assert.equal(typeof unpushed.props.onContextMenu, 'function', 'commits open a context menu')
+  const menuItems = () => updates.filter((entry) => entry.index === 18).pop().next.items
+  const editItem = (element) => {
+    element.props.onContextMenu({ clientX: 12, clientY: 34, preventDefault() {}, stopPropagation() {} })
+    return menuItems().find((item) => item.label === '编辑提交信息…')
+  }
+  const notice = () => updates.filter((entry) => entry.index === 5).pop()?.next
+
+  // Published commits cannot be rewritten: the entry stays, greyed out, with a reason.
+  const blocked = editItem(published)
+  assert.equal(blocked.disabled, true)
+  assert.equal(blocked.hint, '只能改写尚未推送到远端的提交')
+
+  const editable = editItem(unpushed)
+  assert.notEqual(editable.disabled, true)
+  assert.equal(editable.hint, undefined)
+
+  editable.onSelect()
+  await flush()
+  assert.deepEqual(requests.map((body) => body.op), ['commit'])
+  assert.equal(requests[0].sha, 'c'.repeat(40))
+  const dialog = updates.filter((entry) => entry.index === 19).pop().next
+  assert.equal(dialog.kind, 'text')
+  assert.equal(dialog.multiline, true)
+  assert.equal(dialog.title, '编辑提交信息')
+  assert.equal(dialog.confirmText, '保存')
+  assert.equal(dialog.text, '提交 cccccccc，作者 tianhaiqing。改写会重写此后的提交哈希。')
+  assert.equal(dialog.value, 'fix(web-core): 页面内容区无法滚动\n\n原来的正文行', 'the body must be pre-filled too')
+
+  // A `text` dialog resolves to `{ value, checked }` — resolving with a bare
+  // string is not what the real Dialog does, and doing so once hid a bug that
+  // sent the literal "[object Object]" to git.
+  holder.refs[0].current({ value: 'fix(web-core): 页面内容区可以滚动了\n\n改后的正文', checked: false })
+  await flush()
+  assert.deepEqual(requests.map((body) => body.op), ['commit', 'reword', 'snapshot'])
+  assert.equal(requests[1].sha, 'c'.repeat(40))
+  assert.equal(requests[1].message, 'fix(web-core): 页面内容区可以滚动了\n\n改后的正文')
+  assert.equal(notice().kind, 'ok')
+  assert.equal(notice().text, '已改写 cccccccc 的提交信息')
+  // Later commits got new hashes, so the old selection cannot survive.
+  assert.equal(updates.filter((entry) => entry.index === 9).pop().next, null)
+
+  // An empty message never reaches the engine.
+  editable.onSelect()
+  await flush()
+  holder.refs[0].current({ value: '   ', checked: false })
+  await flush()
+  assert.equal(notice().kind, 'error')
+  assert.equal(notice().text, '提交信息不能为空')
+  assert.deepEqual(requests.map((body) => body.op), ['commit', 'reword', 'snapshot', 'commit'])
 })

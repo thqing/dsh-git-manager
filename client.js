@@ -134,6 +134,15 @@ window.__ModuleLoader__.load({
       'menu.detachAt': '检出此提交（分离头指针）',
       'menu.cherryPick': '摘取此提交',
       'menu.revert': '回滚此提交',
+      'menu.editMessage': '编辑提交信息…',
+      'menu.editMessageHint': '只能改写尚未推送到远端的提交',
+      'menu.editMessageRestart': '宿主尚未实现该操作，重启 DSH 后可用',
+      'dialog.reword.title': '编辑提交信息',
+      'dialog.reword.text': '提交 {sha}，作者 {author}。改写会重写此后的提交哈希。',
+      'dialog.reword.empty': '提交信息不能为空',
+      'dialog.reword.confirm': '保存',
+      'dialog.reword.done': '已改写 {sha} 的提交信息',
+      'dialog.reword.unchanged': '提交信息没有变化',
       'menu.resetSoft': '重置到此（soft）',
       'menu.resetMixed': '重置到此（mixed）',
       'menu.resetHard': '重置到此（hard）',
@@ -291,6 +300,15 @@ window.__ModuleLoader__.load({
       'menu.detachAt': 'Checkout this commit (detached)',
       'menu.cherryPick': 'Cherry-pick this commit',
       'menu.revert': 'Revert this commit',
+      'menu.editMessage': 'Edit Commit Message…',
+      'menu.editMessageHint': 'Only commits that are not pushed yet can be edited',
+      'menu.editMessageRestart': 'The Host does not implement this yet; restart DSH',
+      'dialog.reword.title': 'Edit Commit Message',
+      'dialog.reword.text': 'Commit {sha} by {author}. Rewriting it changes the hashes of later commits.',
+      'dialog.reword.empty': 'The commit message cannot be empty',
+      'dialog.reword.confirm': 'Save',
+      'dialog.reword.done': 'Rewrote the message of {sha}',
+      'dialog.reword.unchanged': 'The commit message did not change',
       'menu.resetSoft': 'Reset here (soft)',
       'menu.resetMixed': 'Reset here (mixed)',
       'menu.resetHard': 'Reset here (hard)',
@@ -782,6 +800,9 @@ window.__ModuleLoader__.load({
         return () => document.removeEventListener('keydown', onKey, true)
       }, [dialog, value, props])
       const fields = []
+      // A text dialog may still explain itself ("commit abc by …, rewriting moves
+      // every later hash"); the input is added below.
+      if (dialog.kind === 'text' && dialog.text) fields.push(h('div', { key: 'm', className: 'dg-hint' }, dialog.text))
       if (dialog.kind === 'text') {
         fields.push(h('div', { className: 'dg-field', key: 'f' },
           dialog.label ? h('div', { className: 'dg-label' }, dialog.label) : null,
@@ -896,6 +917,7 @@ window.__ModuleLoader__.load({
               role: 'menuitem',
               className: `dg-menu-item${item.danger ? ' dg-danger' : ''}`,
               disabled: item.disabled === true,
+              title: item.hint,
               onClick: () => {
                 props.onClose()
                 item.onSelect?.()
@@ -1096,6 +1118,7 @@ window.__ModuleLoader__.load({
       const [repoError, setRepoError] = useState(null)
       const [supportsSquash, setSupportsSquash] = useState(false)
       const [supportsUpdate, setSupportsUpdate] = useState(null)
+      const [supportsReword, setSupportsReword] = useState(null)
       const dialogResolver = useRef(null)
       const snapshotRef = useRef(null)
       const mountedRef = useRef(true)
@@ -1124,6 +1147,7 @@ window.__ModuleLoader__.load({
             const ops = Array.isArray(caps?.ops) ? caps.ops : []
             if (alive) setSupportsSquash(ops.includes('squash'))
             if (alive) setSupportsUpdate(ops.includes('updateProject'))
+            if (alive) setSupportsReword(ops.includes('reword'))
           } catch {
             // An older Host answers `未知操作`; history rewrite stays hidden.
             if (alive) setSupportsSquash(false)
@@ -1674,6 +1698,62 @@ window.__ModuleLoader__.load({
         await run({ op: 'createTag', name: name.value.trim(), ref: ref ?? undefined, message: messageResult?.value ?? '' })
       }, [askText, run, tText])
 
+      /** IDEA's "Edit Commit Message": only local commits can be rewritten. */
+      const editMessage = useCallback(async (commit) => {
+        if (!repoPath || busy) return
+        let detail
+        setBusy(t('dialog.reword.title'))
+        try {
+          const data = await call({ op: 'commit', repo: repoPath, sha: commit.hash })
+          detail = data.commit
+        } catch (error) {
+          showError(error)
+          return
+        } finally {
+          if (mountedRef.current) setBusy(null)
+        }
+        // The whole message, not just the subject: reword must not silently drop a body.
+        const initial = [detail?.subject, detail?.body]
+          .map((part) => (typeof part === 'string' ? part.replace(/\s+$/, '') : ''))
+          .filter((part) => part !== '')
+          .join('\n\n')
+        const answer = await ask({
+          kind: 'text',
+          multiline: true,
+          title: t('dialog.reword.title'),
+          text: tText('dialog.reword.text', { sha: shortHash(commit.hash), author: commit.author }),
+          value: initial,
+          confirmText: t('dialog.reword.confirm'),
+        })
+        if (answer === null) return
+        // A `text` dialog resolves to `{ value, checked }`, so reading the whole
+        // answer would send the literal string "[object Object]" to git.
+        const message = String(answer?.value ?? '')
+        if (message.trim() === '') {
+          setNotice({ kind: 'error', text: t('dialog.reword.empty') })
+          return
+        }
+        setBusy(t('dialog.reword.title'))
+        try {
+          const data = await call({ op: 'reword', repo: repoPath, sha: commit.hash, message })
+          await load()
+          if (mountedRef.current) {
+            if (data?.changed === false) {
+              setNotice({ kind: 'ok', text: t('dialog.reword.unchanged') })
+            } else {
+              setNotice({ kind: 'ok', text: tText('dialog.reword.done', { sha: shortHash(commit.hash) }) })
+              // Every later commit got a new hash: keep no stale selection behind.
+              setSelection(null)
+              setDetail(null)
+            }
+          }
+        } catch (error) {
+          showError(error)
+        } finally {
+          if (mountedRef.current) setBusy(null)
+        }
+      }, [ask, busy, call, load, repoPath, showError, t, tText])
+
       const commitMenu = useCallback((event, commit) => {
         const current = selection?.type === 'commit' && (selection.hashes ?? []).includes(commit.hash)
           ? selection
@@ -1699,6 +1779,14 @@ window.__ModuleLoader__.load({
           { separator: true },
           { label: tText('menu.cherryPick'), disabled: multi, onSelect: () => void run({ op: 'cherryPick', sha: commit.hash }, { label: tText('menu.cherryPick') }) },
           { label: tText('menu.revert'), disabled: multi, onSelect: () => void run({ op: 'revert', sha: commit.hash }, { label: tText('menu.revert') }) },
+          {
+            label: t('menu.editMessage'),
+            disabled: multi || commit.pushed === true || supportsReword === false,
+            hint: commit.pushed === true
+              ? t('menu.editMessageHint')
+              : (supportsReword === false ? t('menu.editMessageRestart') : undefined),
+            onSelect: () => void editMessage(commit),
+          },
           { separator: true },
           { label: tText('menu.resetSoft'), disabled: multi, onSelect: () => void run({ op: 'reset', ref: commit.hash, mode: 'soft' }) },
           { label: tText('menu.resetMixed'), disabled: multi, onSelect: () => void run({ op: 'reset', ref: commit.hash, mode: 'mixed' }) },
@@ -1717,7 +1805,7 @@ window.__ModuleLoader__.load({
           { label: tText('menu.copyName'), onSelect: () => copyText(commit.subject) },
         )
         openMenu(event, items)
-      }, [askConfirm, clearSelection, createTag, doCheckout, newBranch, openMenu, run, selection, startSquash, supportsSquash, tText])
+      }, [askConfirm, clearSelection, createTag, doCheckout, editMessage, newBranch, openMenu, run, selection, startSquash, supportsReword, supportsSquash, t, tText])
 
       const stashMenu = useCallback((event, stash) => {
         openMenu(event, [

@@ -35,6 +35,7 @@ const SERIALIZED_OPS = new Set([
   'revert',
   'reset',
   'squash',
+  'reword',
   'fetch',
   'pull',
   'updateProject',
@@ -146,6 +147,7 @@ const TOOL_ACTIONS = {
   fetch: 'fetch',
   pull: 'pull',
   update_project: 'updateProject',
+  reword_commit: 'reword',
   push: 'push',
   stage: 'stage',
   unstage: 'unstage',
@@ -206,6 +208,10 @@ function summarize(action, data) {
     const verb = data.strategy === 'rebase' ? '变基' : data.strategy === 'reset' ? '重置' : '合并'
     return `已把 ${data.upstream} 的 ${data.behind} 个提交${verb}到 ${data.branch}`
   }
+  if (action === 'reword_commit') {
+    if (data.changed === false) return `${String(data.sha ?? '').slice(0, 8)} 的提交信息没有变化`
+    return `已改写 ${String(data.sha ?? '').slice(0, 8)} 的提交信息：${data.subject ?? ''}`
+  }
   if (action === 'diff') return data.diff ? `差异 ${String(data.diff).length} 字符${data.truncated ? '（已截断）' : ''}` : '无差异'
   if (action === 'discover') {
     const repos = (data.repos ?? []).filter((entry) => entry.isRepo)
@@ -238,7 +244,7 @@ function registerTool(toolCtx, run, settings) {
         paths: { type: 'array', items: { type: 'string' }, description: '文件路径列表（stage/unstage/discard/diff）。' },
         remote: { type: 'string', description: '远程仓库名，例如 origin。' },
         branch: { type: 'string', description: '远程分支名（pull/push/delete）。' },
-        sha: { type: 'string', description: '提交哈希（commit_detail/revert/cherry_pick）。' },
+        sha: { type: 'string', description: '提交哈希（commit_detail/revert/cherry_pick/reword_commit）。' },
         mode: { type: 'string', enum: ['soft', 'mixed', 'hard', 'keep'], description: 'reset 模式。' },
         startPoint: { type: 'string', description: '创建分支的起点。' },
         strategy: {
